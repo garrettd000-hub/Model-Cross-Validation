@@ -1,0 +1,14 @@
+Cross validation is a technique that is used to estimate the performance of a model by repeatedly training with and testing on different subsets of your data.
+For example, you can do a 5 fold where you shuffle and then divide data into 5 subsets. You then train your model for the best fit with 4 of the subsets, average results after and keep one subset for testing the models efficacy.
+This is quite effective, but it can also present some issues. For example, data leakage is a concern that could influence your testing set and throw off your test results.
+You can prevent this by not doing any pre-processing with the testing set with the training sets. For example, don’t call .fit() on the full data before the cross validation.
+
+Viral load data and gene expression were pulled from the pdata and expression data of the downloaded dataset. These were filtered for only covid positive individual RNA expression results and leaving out an NA or unknown data.
+A linear model was fit and ANOVA performed for all genes against viral load. Results were Bonferroni corrected and results were ordered into a new data frame.
+The most significant based on rank was reported to be TPT1 with its expression across sampled plotted against viral load. It has a strong predictive effect on viral load as seen in the generated plot and the corrected p-value of 1.490409e-14.
+
+Genes were filtered by gene expression for this question to remove low expression genes to ease on the CPU demand of this code block. A function was written for loops of 50 and 250 iterations for all genes where top 5 expressed genes were saved.
+Code for cross validation and bootstrap were adapted from this week’s notes to fit within this loop for each gene and iteration. The top 5 genes were reported and a boxplot of the top 5 genes comparing 50 and 250 iterations was generated.
+Unsurprisingly, TPT1 was the best predictive gene which is in agreement with the simpler linear model fit function block. The numbers from the console indicate how often the genes appeared in the top 5.
+TPT1 is certainly the winner here, but the few other weren’t far off. And from the boxplot, the MSEs were quite similar for all 5, so they are all quite close and good predictors for viral load.
+The fact that the plots between 50 and 250 are very close tells me that 50 iterations was certainly sufficient and that 250 was unnecessary.
