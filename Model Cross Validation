@@ -1,0 +1,206 @@
+library(GEOquery)
+
+# Load data
+# Download them (creates a GSE152075/ folder in working directory)
+getGEOSuppFiles("GSE152075")
+
+# See what was downloaded
+list.files("GSE152075/")
+
+#Question 2
+# Grabs normalized expression data
+counts <- read.table("GSE152075/GSE152075_raw_counts_GEO.txt.gz",
+                     header = TRUE, row.names = 1, sep = "")
+
+gset <- getGEO("GSE152075", GSEMatrix = TRUE)[[1]]
+pd <- pData(gset)
+
+# Log transform to normalize counts data
+log.counts <- log2(counts + 1)   # +1 avoids log(0) = -Inf
+
+# Extract viral load data
+pd$viral_load <- as.numeric(
+  gsub("n1_ct: ", "", pd$characteristics_ch1.1)
+)
+
+# "Unknown" becomes NA before filtering out missing viral load samples and virus negative samples
+pd$viral_load[pd$viral_load == "Unknown"] <- NA
+
+# Keep only virus positive samples
+pd_pos <- pd[!is.na(pd$viral_load), ]
+
+# Subset expression matrix to match
+counts_pos <- log.counts[, pd_pos$title]
+
+# Checks alignment
+stopifnot(all(colnames(counts_pos) == pd_pos$title))
+
+# Fits a linear model for every gene against viral load
+# Fit lm for every gene with viral load as dependent
+results <- apply(counts_pos, 1, function(gene.expr) {
+  tryCatch({
+    fit <- lm(pd_pos$viral_load ~ gene.expr)
+    
+    aov_p <- summary(aov(fit))[[1]]$`Pr(>F)`[1]
+    lm_p  <- summary(fit)$coefficients["gene.expr", "Pr(>|t|)"]
+    
+    c(anova_p = aov_p, lm_p = lm_p)
+  }, error = function(e) {
+    c(anova_p = NA, lm_p = NA)   # fill with NA if model fails
+  })
+})
+
+# Transpose to genes x metrics
+results.df <- as.data.frame(t(results))
+results.df$gene <- rownames(results.df)
+
+# Bonferroni correction
+results.df$bonferroni <- p.adjust(results.df$anova_p, method = "bonferroni")
+
+# Order genes by ANOVA p-value significance
+results.ordered <- results.df[order(results.df$anova_p), ]
+
+# remove NA rows
+results.ordered <- results.ordered[!is.na(results.ordered$anova_p) & 
+                                     !is.na(results.ordered$bonferroni), ]
+
+# Re-rank after removing NAs
+results.ordered$rank <- 1:nrow(results.ordered)
+
+#Prints the best predictive gene
+print(results.ordered[1, ])
+
+# Plot gene relationship
+tpt1.expr <- as.numeric(counts_pos["TPT1", ])
+plot(tpt1.expr, pd_pos$viral_load,
+     xlab = "TPT1 Expression",
+     ylab = "Viral Load (Ct)",
+     main = "TPT1 Expression vs Viral Load")
+abline(lm(pd_pos$viral_load ~ tpt1.expr), col = "red")
+
+#Question 3
+
+# Filter lowly expressed genes to lower CPU demand
+counts_pos <- counts_pos[rowSums(counts_pos > 0) >= 0.2 * ncol(counts_pos), ]
+
+# Correlate screen
+cors <- apply(counts_pos, 1, function(g) {
+  cor(g, pd_pos$viral_load, use = "complete.obs")
+})
+top100 <- names(sort(abs(cors), decreasing = TRUE))[1:100]
+counts_screen <- counts_pos[top100, ]
+
+# Initialize
+mse.cv.results   <- numeric(nrow(counts_screen))
+mse.boot.results <- numeric(nrow(counts_screen))
+names(mse.cv.results)   <- rownames(counts_screen)
+names(mse.boot.results) <- rownames(counts_screen)
+
+# Loop number for each test
+val.num <- 5
+n.boot  <- 50
+
+# Function to run twice with 50 vs 250 iterations
+run.xval <- function(counts_screen, pd_pos, n.boot = 50, val.num = 5) {
+  
+  n.obs <- ncol(counts_screen)
+  all.best.xval.genes <- c()
+  all.s2.boot <- numeric()
+  gene.s2.list <- list()
+  
+  for (i.boot in 1:n.boot) {
+    
+    val.grps <- sample(1:n.obs %% val.num + 1)
+    mse.cv.results <- numeric(nrow(counts_screen))
+    names(mse.cv.results) <- rownames(counts_screen)
+    
+    for (gene in rownames(counts_screen)) {
+      cv.df <- data.frame(expr       = as.numeric(counts_screen[gene, ]),
+                          viral.load = pd_pos$viral_load)
+      s2.val <- numeric()
+      
+      for (i.val in 1:val.num) {
+        test.df   <- cv.df[val.grps == i.val, ]
+        train.df  <- cv.df[val.grps != i.val, ]
+        lm.val    <- lm(viral.load ~ expr, train.df)
+        test.pred <- predict(lm.val, test.df)
+        s2.val    <- c(s2.val, (test.pred - test.df$viral.load)^2)
+      }
+      mse.cv.results[gene] <- mean(s2.val, na.rm = TRUE)
+    }
+    
+    # Save top 5 genes from this simulation
+    top5.this.sim <- names(sort(mse.cv.results)[1:5])
+    all.best.xval.genes <- c(all.best.xval.genes, top5.this.sim)
+    
+    # Fit for top 5 genes and stores squared error
+    for (g in top5.this.sim) {
+      g.df <- data.frame(expr       = as.numeric(counts_screen[g, ]),
+                         viral.load = pd_pos$viral_load)
+      lm.g     <- lm(viral.load ~ expr, g.df)
+      fitted.g <- predict(lm.g, g.df)
+      s2.g     <- (fitted.g - g.df$viral.load)^2
+      
+      gene.s2.list[[length(gene.s2.list) + 1]] <- data.frame(
+        gene = rep(g, length(s2.g)),
+        s2   = as.numeric(s2.g)
+      )
+      
+      if (g == top5.this.sim[1]) {
+        all.s2.boot <- c(all.s2.boot, s2.g)
+      }
+    }
+  }
+  
+  gene.s2.df  <- do.call(rbind, gene.s2.list)
+  
+  # Top 5 genes selected most frequently across all simulations
+  gene.counts <- sort(table(all.best.xval.genes), decreasing = TRUE)
+  top5.genes  <- head(gene.counts, 5)
+  
+  list(
+    all.best.xval.genes = all.best.xval.genes,
+    all.s2.boot         = all.s2.boot,
+    mse.overall         = mean(all.s2.boot, na.rm = TRUE),
+    top5.genes          = top5.genes,
+    gene.s2.df          = gene.s2.df
+  )
+}
+
+# Function run
+results.50  <- run.xval(counts_screen, pd_pos, n.boot = 50)
+results.250 <- run.xval(counts_screen, pd_pos, n.boot = 250)
+
+# Add simulation label
+df.50  <- results.50$gene.s2.df;  df.50$sim  <- "50 simulations"
+df.250 <- results.250$gene.s2.df; df.250$sim <- "250 simulations"
+combined.df <- rbind(df.50, df.250)
+
+# Get top 5 gene names from each run
+top5.names.50  <- names(results.50$top5.genes)
+top5.names.250 <- names(results.250$top5.genes)
+
+# Union of top 5 from both runs
+top.genes <- union(top5.names.50, top5.names.250)
+
+# Filter squared errors to only top genes
+plot.df <- combined.df[combined.df$gene %in% top.genes, ]
+
+# Boxplot visualization
+library(ggplot2)
+ggplot(plot.df, aes(x = reorder(gene, s2, FUN = median), y = s2, fill = sim)) +
+  geom_boxplot(outlier.size = 0.5) +
+  xlab("Gene") +
+  ylab("Squared Error") +
+  ggtitle("MSE Distribution for Top 5 Genes: 50 vs 250 Simulations") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+cat("\nTop 5 genes (50 simulations):\n")
+print(results.50$top5.genes)
+
+cat("\nTop 5 genes (250 simulations):\n")
+print(results.250$top5.genes)
+
+cat("\nMSE (50 simulations):",  results.50$mse.overall,  "\n")
+cat("MSE (250 simulations):", results.250$mse.overall, "\n")
